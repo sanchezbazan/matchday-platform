@@ -1,5 +1,5 @@
 variable "alert_email" {
   type        = string
-  description = "Terraform code, a budget alert"
+  description = "Email address for budget alerts."
   sensitive = true
 }
