@@ -1,4 +1,6 @@
 """Fetch La Liga and Liga MX scores from ESPN's public scoreboard."""
+
+import functools
 import os
 import sys
 from datetime import UTC, datetime, timedelta
@@ -6,7 +8,9 @@ from datetime import UTC, datetime, timedelta
 import psycopg
 import requests
 
-ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
+ESPN_SCOREBOARD = (
+    "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
+)
 LEAGUES = ["esp.1", "mex.1"]
 
 SESSION = requests.Session()
@@ -60,6 +64,7 @@ def parse_event(event: dict, league: str) -> dict:
         "venue": competition.get("venue", {}).get("fullName"),
     }
 
+
 UPSERT_TEAM = """
     insert into matchday.teams (espn_id, name, abbreviation, logo_url)
     values (%(espn_id)s, %(name)s, %(abbreviation)s, %(logo_url)s)
@@ -100,14 +105,18 @@ def save_matches(conn, matches: list[dict]) -> None:
             teams[team["espn_id"]] = team
 
     rows = [
-        {**m, "home_team_id": m["home_team"]["espn_id"], "away_team_id": m["away_team"]["espn_id"]}
+        {
+            **m,
+            "home_team_id": m["home_team"]["espn_id"],
+            "away_team_id": m["away_team"]["espn_id"],
+        }
         for m in matches
     ]
 
     with conn.cursor() as cur:
         cur.executemany(UPSERT_TEAM, list(teams.values()))
         cur.executemany(UPSERT_MATCH, rows)
-        
+
 
 LIVE_WINDOW_SQL = """
     select distinct
@@ -126,9 +135,24 @@ def find_live_scoreboards(conn) -> list[tuple[str, str]]:
         return cur.fetchall()
 
 
+@functools.cache
+def get_dsn() -> str:
+    """Local runs use DATABASE_URL; in Lambda, read it from SSM Parameter Store."""
+    if "DATABASE_URL" in os.environ:
+        return os.environ["DATABASE_URL"]
+
+    import boto3  # included in the Lambda runtime; not needed locally
+
+    ssm = boto3.client("ssm")
+    param = ssm.get_parameter(
+        Name=os.environ["DATABASE_URL_PARAM"], WithDecryption=True
+    )
+    return param["Parameter"]["Value"]
+
+
 def run(mode: str) -> int:
     """Fetch the scoreboards this mode needs and save them. Returns matches saved."""
-    dsn = os.environ["DATABASE_URL"]
+    dsn = get_dsn()
 
     if mode == "fixtures":
         today = datetime.now(UTC).date()
@@ -146,13 +170,25 @@ def run(mode: str) -> int:
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
 
-    matches = [parse_event(e, league) for league, date in targets for e in fetch_scoreboard(league, date)]
+    matches = [
+        parse_event(e, league)
+        for league, date in targets
+        for e in fetch_scoreboard(league, date)
+    ]
 
     with psycopg.connect(dsn, prepare_threshold=None) as conn:
         save_matches(conn, matches)
 
     print(f"{mode}: saved {len(matches)} matches from {len(targets)} scoreboard(s).")
     return len(matches)
+
+
+def handler(event, context):
+    """AWS Lambda entry point. EventBridge sends {"mode": "fixtures"} or {"mode": "live"}."""
+    mode = event.get("mode", "live")
+    saved = run(mode)
+    return {"mode": mode, "saved": saved}
+
 
 if __name__ == "__main__":
     run(sys.argv[1] if len(sys.argv) > 1 else "live")
