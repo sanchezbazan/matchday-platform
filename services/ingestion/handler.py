@@ -1,6 +1,7 @@
 """Fetch La Liga and Liga MX scores from ESPN's public scoreboard."""
 import os
 import sys
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 import requests
@@ -106,17 +107,52 @@ def save_matches(conn, matches: list[dict]) -> None:
     with conn.cursor() as cur:
         cur.executemany(UPSERT_TEAM, list(teams.values()))
         cur.executemany(UPSERT_MATCH, rows)
+        
+
+LIVE_WINDOW_SQL = """
+    select distinct
+        league_slug,
+        to_char(kickoff_at at time zone 'America/New_York', 'YYYYMMDD') as espn_date
+    from matchday.matches
+    where state <> 'post'
+      and kickoff_at between now() - interval '140 minutes' and now() + interval '5 minutes'
+"""
+
+
+def find_live_scoreboards(conn) -> list[tuple[str, str]]:
+    """Return (league, ESPN date) pairs that have a match in the live window."""
+    with conn.cursor() as cur:
+        cur.execute(LIVE_WINDOW_SQL)
+        return cur.fetchall()
+
+
+def run(mode: str) -> int:
+    """Fetch the scoreboards this mode needs and save them. Returns matches saved."""
+    dsn = os.environ["DATABASE_URL"]
+
+    if mode == "fixtures":
+        today = datetime.now(UTC).date()
+        targets = [
+            (league, (today + timedelta(days=offset)).strftime("%Y%m%d"))
+            for league in LEAGUES
+            for offset in range(-1, 8)
+        ]
+    elif mode == "live":
+        with psycopg.connect(dsn, prepare_threshold=None) as conn:
+            targets = find_live_scoreboards(conn)
+        if not targets:
+            print("live: nothing in the window, skipping ESPN.")
+            return 0
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
+
+    matches = [parse_event(e, league) for league, date in targets for e in fetch_scoreboard(league, date)]
+
+    with psycopg.connect(dsn, prepare_threshold=None) as conn:
+        save_matches(conn, matches)
+
+    print(f"{mode}: saved {len(matches)} matches from {len(targets)} scoreboard(s).")
+    return len(matches)
 
 if __name__ == "__main__":
-    date = sys.argv[1] if len(sys.argv) > 1 else None
-    matches = [parse_event(e, league) for league in LEAGUES for e in fetch_scoreboard(league, date)]
-
-    for m in matches:
-        home, away = m["home_team"]["abbreviation"], m["away_team"]["abbreviation"]
-        hs = "-" if m["home_score"] is None else m["home_score"]
-        aws = "-" if m["away_score"] is None else m["away_score"]
-        print(f"{m['league_slug']}  {home} {hs}–{aws} {away}  [{m['state']}] {m['display_clock']}")
-
-    with psycopg.connect(os.environ["DATABASE_URL"], prepare_threshold=None) as conn:
-        save_matches(conn, matches)
-    print(f"Saved {len(matches)} matches.")
+    run(sys.argv[1] if len(sys.argv) > 1 else "live")
