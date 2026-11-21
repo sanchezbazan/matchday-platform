@@ -1,7 +1,8 @@
 """Fetch La Liga and Liga MX scores from ESPN's public scoreboard."""
-
+import os
 import sys
 
+import psycopg
 import requests
 
 ESPN_SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/soccer/{league}/scoreboard"
@@ -58,13 +59,64 @@ def parse_event(event: dict, league: str) -> dict:
         "venue": competition.get("venue", {}).get("fullName"),
     }
 
+UPSERT_TEAM = """
+    insert into matchday.teams (espn_id, name, abbreviation, logo_url)
+    values (%(espn_id)s, %(name)s, %(abbreviation)s, %(logo_url)s)
+    on conflict (espn_id) do update set
+        name         = excluded.name,
+        abbreviation = excluded.abbreviation,
+        logo_url     = excluded.logo_url
+"""
+
+UPSERT_MATCH = """
+    insert into matchday.matches (
+        espn_id, league_slug, season_year, season_slug, kickoff_at,
+        home_team_id, away_team_id, home_score, away_score,
+        state, status_name, display_clock, venue
+    )
+    values (
+        %(espn_id)s, %(league_slug)s, %(season_year)s, %(season_slug)s, %(kickoff_at)s,
+        %(home_team_id)s, %(away_team_id)s, %(home_score)s, %(away_score)s,
+        %(state)s, %(status_name)s, %(display_clock)s, %(venue)s
+    )
+    on conflict (espn_id) do update set
+        kickoff_at    = excluded.kickoff_at,
+        home_score    = excluded.home_score,
+        away_score    = excluded.away_score,
+        state         = excluded.state,
+        status_name   = excluded.status_name,
+        display_clock = excluded.display_clock,
+        venue         = excluded.venue,
+        updated_at    = now()
+"""
+
+
+def save_matches(conn, matches: list[dict]) -> None:
+    """Upsert teams first (matches reference them), then matches."""
+    teams = {}
+    for m in matches:
+        for team in (m["home_team"], m["away_team"]):
+            teams[team["espn_id"]] = team
+
+    rows = [
+        {**m, "home_team_id": m["home_team"]["espn_id"], "away_team_id": m["away_team"]["espn_id"]}
+        for m in matches
+    ]
+
+    with conn.cursor() as cur:
+        cur.executemany(UPSERT_TEAM, list(teams.values()))
+        cur.executemany(UPSERT_MATCH, rows)
 
 if __name__ == "__main__":
     date = sys.argv[1] if len(sys.argv) > 1 else None
-    for league in LEAGUES:
-        for event in fetch_scoreboard(league, date):
-            m = parse_event(event, league)
-            home, away = m["home_team"]["abbreviation"], m["away_team"]["abbreviation"]
-            hs = "-" if m["home_score"] is None else m["home_score"]
-            aws = "-" if m["away_score"] is None else m["away_score"]
-            print(f"{league}  {home} {hs}–{aws} {away}  [{m['state']}] {m['display_clock']}  {m['kickoff_at']}")
+    matches = [parse_event(e, league) for league in LEAGUES for e in fetch_scoreboard(league, date)]
+
+    for m in matches:
+        home, away = m["home_team"]["abbreviation"], m["away_team"]["abbreviation"]
+        hs = "-" if m["home_score"] is None else m["home_score"]
+        aws = "-" if m["away_score"] is None else m["away_score"]
+        print(f"{m['league_slug']}  {home} {hs}–{aws} {away}  [{m['state']}] {m['display_clock']}")
+
+    with psycopg.connect(os.environ["DATABASE_URL"], prepare_threshold=None) as conn:
+        save_matches(conn, matches)
+    print(f"Saved {len(matches)} matches.")
